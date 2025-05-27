@@ -289,7 +289,6 @@ def argmax_sampling(logits: np.ndarray):
   prob = softmax.max(axis=-1)
   return idx, prob
 
-  # return logits.log_softmax(axis=-1).argmax(axis=-1), logits.log_softmax(axis=-1).max(axis=-1)
 def multinomial_sampling(logits: Tensor, temperature: int):
   scaled = (logits / (temperature if temperature != 0 else 1)).softmax(axis=-1)
   next_tokens = scaled.multinomial(1)
@@ -350,7 +349,7 @@ def non_speech_filter(logits: np.ndarray):
 
 def suppress_blank(logits: np.ndarray, enc: Encoding):
   tokens = np.array([enc.encode(" ")[0], enc._special_tokens["<|endoftext|>"]])
-  logits[:, tokens] = -math.inf
+  logits[:, tokens] = -np.inf
 
 def replace_eot(tokens: np.ndarray, ctx: np.ndarray, eot: int):
   last = ctx[:, -1]
@@ -571,56 +570,93 @@ def transcribe_waveform(model: Whisper, enc: tiktoken.Encoding, waveforms, outpu
   return transcribed
 
 CHUNK = 1600
-RECORD_SECONDS = 10
+RECORD_SECONDS = 1800
 
 def listener(q):
   import pyaudio
   p = pyaudio.PyAudio()
   stream = p.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, frames_per_buffer=CHUNK)
-  print("listening")
-  for _ in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
-    data = stream.read(CHUNK)
-    waveform = ((np.frombuffer(data, np.int16)/32768).astype(np.float32)*3)
-    q.put(waveform)
-  print("done listening")
+  print("Listening for up to 30 minutes...")
+  try:
+    for _ in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
+      data = stream.read(CHUNK, exception_on_overflow=False)
+      waveform = ((np.frombuffer(data, np.int16)/32768).astype(np.float32)*3)
+      q.put(waveform)
+  except KeyboardInterrupt:
+    print("Recording stopped by user")
+  finally:
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+    print("Done listening")
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", type=str, default="tiny.en", help="name of model")
-  parser.add_argument("--audio", type=str, required=True, help="path to an mp3 audio file")
+  parser.add_argument("--audio", type=str, help="path to an audio file")
+  parser.add_argument("--output", type=str, default="transcribed.txt", help="path to output text file")
   parser.add_argument("--beam", action=argparse.BooleanOptionalAction, default=True, help="Whether to use beam decoding")
   args = parser.parse_args()
   model, enc = init_whisper(args.model, batch_size=1)
 
-  if len(sys.argv) > 1:
-    with open("transcribed.txt", "w") as output_fh:
+  if args.audio:
+    with open(args.output, "w", encoding="utf-8") as output_fh:
       transcribed = transcribe_file(model, enc, args.audio, output_fh, args.beam)
-      with open("transcribed.json", "w") as output_fh2:
+      json_output = args.output.replace(".txt", ".json")
+      with open(json_output, "w", encoding="utf-8") as output_fh2:
         json.dump(transcribed, output_fh2, indent=2)
   else:
-    # online
     q = multiprocessing.Queue()
     p = multiprocessing.Process(target=listener, args=(q,))
     p.daemon = True
     p.start()
-
-    lst = [enc._special_tokens["<|startoftranscript|>"], enc._special_tokens["<|notimestamps|>"]]
+    start_tokens = get_start_tokens(enc, model.is_multilingual)
+    ctx = np.array(start_tokens)
     total = None
-    did_read = False
-    for i in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
-      while not q.empty() or total is None:
-        waveform = q.get()
-        if total is None: total = waveform
-        else: total = np.concatenate([total, waveform])
-        did_read = True
-      if did_read:
-        log_spec = prep_audio(total.reshape(1, -1), model.batch_size, truncate=True)
-        encoded_audio = model.encoder.encode(Tensor(log_spec))
-      # pass the previously inferred tokens as 'prefix' - https://github.com/openai/whisper/discussions/117#discussioncomment-3727051
-      out = model.decoder(Tensor([lst]), 0, encoded_audio, streaming=True).realize()
-      idx = int(out[0,-1].argmax().numpy().item())
-      lst.append(idx)
-      dec = enc.decode(lst)
-      print(dec) # DO NOT REMOVE PRINT. IT'S VERY IMPORTANT
-      if dec.endswith("<|endoftext|>"):
-        lst.pop()
+    start_time = 0
+    last_dec = ""
+    with open(args.output, "w", encoding="utf-8") as output_fh:
+      while p.is_alive() or not q.empty():
+        did_read = False
+        while not q.empty():
+          waveform = q.get()
+          if total is None:
+            total = waveform
+          else:
+            total = np.concatenate([total, waveform])
+          did_read = True
+        if did_read and len(total) >= SAMPLES_PER_SEGMENT:
+          log_spec = prep_audio(total[:SAMPLES_PER_SEGMENT].reshape(1, -1), model.batch_size, truncate=True)
+          encoded_audio = model.encoder.encode(Tensor(log_spec))
+          to_decode = np.tile(ctx, (5, 1))
+          for t in [0, 0.2, 0.4, 0.6, 0.8, 1.0]:
+            infer_result = inferloop(model, to_decode, encoded_audio, t, (len(start_tokens))*2, enc, args.beam)
+            if infer_result is None:
+              continue
+            inferred, sum_probs = infer_result
+            sum_probs = sum_probs.tolist()
+            avg_probs = [sum_probs[i] / len(seq) for i, seq in enumerate(inferred)]
+            candidate_idx = avg_probs.index(max(avg_probs))
+            selected = inferred[candidate_idx]
+            eoti = index[0] if (index := np.where(selected == enc._special_tokens["<|endoftext|>"])[0]).size > 0 else None
+            soti = np.where(selected == start_tokens[-1])[0][0] + 1
+            tokens = selected[soti:eoti]
+            text = enc.decode(tokens)
+            compression = compression_ratio(text)
+            if compression >= 2.4 or avg_probs[candidate_idx] < -1.0:
+              continue
+            segments = list(segment_and_seek(tokens, enc, start_time))
+            context_for_next = []
+            for segment in segments:
+              text = f"{format_time(int(segment.start))} -> {format_time(int(segment.end))}: {segment.text}"
+              if text != last_dec:
+                print(text)
+                output_fh.write(f"{text}\n")
+                output_fh.flush()
+                last_dec = text
+              context_for_next.extend(segment.tokens)
+            start_time = segment.end
+            ctx = np.array([enc._special_tokens['<|startofprev|>']] + context_for_next[-len(start_tokens):] + start_tokens)
+            break
+          total = total[SAMPLES_PER_SEGMENT:] if len(total) > SAMPLES_PER_SEGMENT else None
+    p.terminate()
